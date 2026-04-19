@@ -1,0 +1,21 @@
+# Build outputs
+dist/
+dbflow-agent
+dbflow-agent.exe
+
+# Go
+*.test
+*.out
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Python leftovers (replaced by Go)
+__pycache__/
+*.pyc
+venv/
+.env
