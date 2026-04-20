@@ -23,7 +23,6 @@ Credentials never leave your machine unencrypted. The agent only listens on `127
 | PostgreSQL | ✅ | |
 | MySQL / MariaDB | ✅ | |
 | SQL Server | ✅ | |
-| SQLite | ✅ | `database` field = file path, e.g. `/home/user/app.db` |
 
 ---
 

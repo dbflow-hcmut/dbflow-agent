@@ -25,7 +25,6 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
 	_ "github.com/microsoft/go-mssqldb"
-	_ "modernc.org/sqlite"
 )
 
 const (
@@ -850,227 +849,6 @@ func mssqlLength(typeName string, maxLen, precision, scale int64) *string {
 	return nil
 }
 
-// ─── SQLite ───────────────────────────────────────────────────────────
-
-// sqliteOpen opens a SQLite file. The `database` field is the file path.
-func sqliteOpen(p ConnectionParams) (*sql.DB, error) {
-	dsn := p.Database
-	if dsn == "" {
-		dsn = ":memory:"
-	}
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, err
-	}
-	db.SetMaxOpenConns(1)
-	if err = db.Ping(); err != nil {
-		db.Close()
-		return nil, err
-	}
-	return db, nil
-}
-
-func testSQLite(p ConnectionParams) error {
-	db, err := sqliteOpen(p)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	logger.Debug("sqlite: ping", "db", p.Database)
-	return db.QueryRow("SELECT 1").Scan(new(int))
-}
-
-// listSchemasSQLite returns ["main"]. SQLite has a single implicit schema;
-// attached databases are outside the scope of this agent.
-func listSchemasSQLite(_ ConnectionParams) ([]string, error) {
-	return []string{"main"}, nil
-}
-
-func introspectSQLite(p IntrospectParams) ([]Table, error) {
-	db, err := sqliteOpen(p.ConnectionParams)
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close()
-
-	// 1. Table names
-	tRows, err := db.Query(`
-		SELECT name FROM sqlite_master
-		WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-		ORDER BY name
-	`)
-	if err != nil {
-		return nil, err
-	}
-	var tableNames []string
-	for tRows.Next() {
-		var name string
-		if err := tRows.Scan(&name); err != nil {
-			tRows.Close()
-			return nil, err
-		}
-		tableNames = append(tableNames, name)
-	}
-	tRows.Close()
-
-	tables := make([]Table, 0, len(tableNames))
-	for _, tableName := range tableNames {
-		quoted := sqliteQuoteIdent(tableName)
-
-		// 2. Columns: cid | name | type | notnull | dflt_value | pk
-		type rawSQLiteCol struct {
-			cid     int64
-			name    string
-			colType string
-			notNull int64
-			dflt    sql.NullString
-			pk      int64
-		}
-		colRows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", quoted))
-		if err != nil {
-			return nil, err
-		}
-		var rawCols []rawSQLiteCol
-		for colRows.Next() {
-			var r rawSQLiteCol
-			if err := colRows.Scan(&r.cid, &r.name, &r.colType, &r.notNull, &r.dflt, &r.pk); err != nil {
-				colRows.Close()
-				return nil, err
-			}
-			rawCols = append(rawCols, r)
-		}
-		colRows.Close()
-
-		// 3. Unique single-column indexes (call after colRows is closed)
-		uniqueCols := sqliteUniqueCols(db, tableName)
-
-		columns := make([]Column, 0, len(rawCols))
-		for _, r := range rawCols {
-			isPK := r.pk > 0
-			var defVal *string
-			if r.dflt.Valid {
-				defVal = &r.dflt.String
-			}
-			// Single INTEGER PRIMARY KEY = ROWID alias = auto-increment
-			autoInc := isPK && strings.EqualFold(strings.TrimSpace(r.colType), "INTEGER")
-			columns = append(columns, Column{
-				Name:          r.name,
-				DataType:      strings.ToUpper(r.colType),
-				Nullable:      r.notNull == 0 && !isPK,
-				IsPrimaryKey:  isPK,
-				IsUnique:      isPK || uniqueCols[r.name],
-				AutoIncrement: autoInc,
-				DefaultValue:  defVal,
-			})
-		}
-
-		// 4. Foreign keys: id | seq | table | from | to | on_update | on_delete | match
-		fkRows, err := db.Query(fmt.Sprintf("PRAGMA foreign_key_list(%s)", quoted))
-		if err != nil {
-			return nil, err
-		}
-		fkMap := map[int64]*ForeignKey{}
-		var fkOrder []int64
-		for fkRows.Next() {
-			var (
-				id       int64
-				seq      int64
-				refTable string
-				fromCol  string
-				toCol    sql.NullString
-				onUpdate string
-				onDelete string
-				match    string
-			)
-			if err := fkRows.Scan(&id, &seq, &refTable, &fromCol, &toCol,
-				&onUpdate, &onDelete, &match); err != nil {
-				continue
-			}
-			if _, exists := fkMap[id]; !exists {
-				name := fmt.Sprintf("fk_%s_%d", tableName, id)
-				fkMap[id] = &ForeignKey{
-					ConstraintName: name,
-					Columns:        []string{},
-					RefTable:       refTable,
-					RefColumns:     []string{},
-					OnDelete:       onDelete,
-					OnUpdate:       onUpdate,
-				}
-				fkOrder = append(fkOrder, id)
-			}
-			refCol := fromCol
-			if toCol.Valid && toCol.String != "" {
-				refCol = toCol.String
-			}
-			fkMap[id].Columns = append(fkMap[id].Columns, fromCol)
-			fkMap[id].RefColumns = append(fkMap[id].RefColumns, refCol)
-		}
-		fkRows.Close()
-
-		fks := make([]ForeignKey, 0, len(fkOrder))
-		for _, id := range fkOrder {
-			fks = append(fks, *fkMap[id])
-		}
-
-		tables = append(tables, Table{
-			Name:        tableName,
-			Columns:     columns,
-			ForeignKeys: fks,
-			Indexes:     []interface{}{},
-		})
-	}
-	return tables, nil
-}
-
-// sqliteQuoteIdent safely double-quotes a SQLite identifier.
-func sqliteQuoteIdent(name string) string {
-	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
-}
-
-// sqliteUniqueCols returns a set of columns covered by single-column UNIQUE indexes.
-func sqliteUniqueCols(db *sql.DB, tableName string) map[string]bool {
-	unique := map[string]bool{}
-	indexRows, err := db.Query(fmt.Sprintf("PRAGMA index_list(%s)", sqliteQuoteIdent(tableName)))
-	if err != nil {
-		return unique
-	}
-	var uniqueIdxNames []string
-	for indexRows.Next() {
-		var seq, partial, isUnique int64
-		var name, origin string
-		if err := indexRows.Scan(&seq, &name, &isUnique, &origin, &partial); err != nil {
-			continue
-		}
-		if isUnique == 1 && origin != "pk" {
-			uniqueIdxNames = append(uniqueIdxNames, name)
-		}
-	}
-	indexRows.Close() // must close before opening new queries on same connection
-
-	for _, idxName := range uniqueIdxNames {
-		infoRows, err := db.Query(fmt.Sprintf("PRAGMA index_info(%s)", sqliteQuoteIdent(idxName)))
-		if err != nil {
-			continue
-		}
-		var cols []string
-		for infoRows.Next() {
-			var seqno, cid int64
-			var colName sql.NullString
-			if err := infoRows.Scan(&seqno, &cid, &colName); err != nil {
-				continue
-			}
-			if colName.Valid {
-				cols = append(cols, colName.String)
-			}
-		}
-		infoRows.Close()
-		if len(cols) == 1 {
-			unique[cols[0]] = true
-		}
-	}
-	return unique
-}
-
 // ─── Shared helpers ───────────────────────────────────────────────────
 
 func queryStringSet(db *sql.DB, query string, args ...interface{}) (map[string]bool, error) {
@@ -1148,8 +926,6 @@ func handleTest(w http.ResponseWriter, r *http.Request) {
 		testErr = testMySQL(params)
 	case "sqlserver":
 		testErr = testMSSQL(params)
-	case "sqlite":
-		testErr = testSQLite(params)
 	default:
 		writeJSON(w, http.StatusOK, TestResult{
 			Success: false,
@@ -1196,8 +972,6 @@ func handleSchemas(w http.ResponseWriter, r *http.Request) {
 		schemas, err = listSchemasMySQL(params)
 	case "sqlserver":
 		schemas, err = listSchemasMSSQL(params)
-	case "sqlite":
-		schemas, err = listSchemasSQLite(params)
 	default:
 		writeJSON(w, http.StatusOK, []string{})
 		return
@@ -1239,8 +1013,6 @@ func handleIntrospect(w http.ResponseWriter, r *http.Request) {
 		tables, err = introspectMySQL(params)
 	case "sqlserver":
 		tables, err = introspectMSSQL(params)
-	case "sqlite":
-		tables, err = introspectSQLite(params)
 	default:
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("Unsupported DBMS: %s", params.DBMS))
 		return
@@ -1278,7 +1050,7 @@ func main() {
 	logger.Info("agent started",
 		"version", agentVersion,
 		"address", fmt.Sprintf("http://%s", addr),
-		"supported_dbms", "postgresql, mysql, sqlserver, sqlite",
+		"supported_dbms", "postgresql, mysql, sqlserver",
 	)
 	logger.Info("endpoints ready",
 		"GET", "/health",
